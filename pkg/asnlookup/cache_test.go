@@ -1,10 +1,13 @@
 package asnlookup
 
 import (
+	"bufio"
 	"compress/gzip"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -404,5 +407,139 @@ func TestASNEntry_Methods(t *testing.T) {
 
 	if entry.GetASDescription() != "CLOUDFLARENET" {
 		t.Errorf("GetASDescription() = %s, want CLOUDFLARENET", entry.GetASDescription())
+	}
+}
+
+func TestCalculatePrefixLength(t *testing.T) {
+	tests := []struct {
+		name  string
+		start string
+		end   string
+		want  int
+	}{
+		{name: "single IPv4 address", start: "10.0.0.1", end: "10.0.0.1", want: 32},
+		{name: "exact IPv4 /24", start: "192.168.1.0", end: "192.168.1.255", want: 24},
+		{name: "non power of two range", start: "1.0.0.0", end: "1.0.0.200", want: 24},
+		{name: "IPv6 /64", start: "2001:db8::", end: "2001:db8::ffff:ffff:ffff:ffff", want: 64},
+		{name: "single IPv6 address", start: "2001:db8::1", end: "2001:db8::1", want: 128},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			start := net.ParseIP(tt.start)
+			end := net.ParseIP(tt.end)
+			if v4 := start.To4(); v4 != nil {
+				start, end = v4, end.To4()
+			}
+
+			if got := calculatePrefixLength(start, end); got != tt.want {
+				t.Errorf("calculatePrefixLength(%s, %s) = %d, want %d", tt.start, tt.end, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLookupASN_EmptyDatabase(t *testing.T) {
+	db := &ASNDatabase{}
+
+	for _, ip := range []string{"8.8.8.8", "2001:4860:4860::8888"} {
+		if entry := db.LookupASN(net.ParseIP(ip)); entry != nil {
+			t.Errorf("LookupASN(%s) = %v, want nil on an empty database", ip, entry)
+		}
+	}
+}
+
+func TestLookupASN_GapBetweenRanges(t *testing.T) {
+	db := newTestDB(t, "1.0.0.0\t1.0.0.255\t13335\tUS\tCLOUDFLARENET\n"+
+		"8.8.8.0\t8.8.8.255\t15169\tUS\tGOOGLE\n")
+
+	if entry := db.LookupASN(net.ParseIP("5.5.5.5")); entry != nil {
+		t.Errorf("LookupASN(5.5.5.5) = AS%d, want nil for an address in a gap", entry.GetASN())
+	}
+}
+
+func TestLookupASN_BelowFirstEntry(t *testing.T) {
+	db := newTestDB(t, "8.8.8.0\t8.8.8.255\t15169\tUS\tGOOGLE\n")
+
+	if entry := db.LookupASN(net.ParseIP("1.1.1.1")); entry != nil {
+		t.Errorf("LookupASN(1.1.1.1) = AS%d, want nil below the first entry", entry.GetASN())
+	}
+}
+
+func TestLookupASN_InvalidIP(t *testing.T) {
+	db := newTestDB(t, "8.8.8.0\t8.8.8.255\t15169\tUS\tGOOGLE\n")
+
+	for _, ip := range []net.IP{nil, {}, {1, 2, 3}, make(net.IP, 5)} {
+		if entry := db.LookupASN(ip); entry != nil {
+			t.Errorf("LookupASN(%v) = %v, want nil for a malformed address", []byte(ip), entry)
+		}
+	}
+}
+
+func TestLoadFromCache_EmptyFile(t *testing.T) {
+	cacheFile := filepath.Join(t.TempDir(), "empty.cache")
+	if err := os.WriteFile(cacheFile, nil, 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	if _, err := loadFromCache(cacheFile); err == nil {
+		t.Error("expected an error for an empty cache file")
+	}
+}
+
+func TestLoadFromCache_TruncatedGzip(t *testing.T) {
+	cacheFile := filepath.Join(t.TempDir(), "truncated.cache")
+	body := gzipFixture(t, fixtureTSVv1)
+	if err := os.WriteFile(cacheFile, body[:len(body)-8], 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	if _, err := loadFromCache(cacheFile); err == nil {
+		t.Error("expected an error for a gzip stream truncated mid-read")
+	}
+}
+
+func TestLoadFromCache_OverlongLine(t *testing.T) {
+	// bufio.Scanner refuses tokens larger than 64 KiB; the parser must report
+	// that as an error rather than silently returning a partial database.
+	overlong := strings.Repeat("x", 70*1024)
+	cacheFile := writeTestCache(t, "overlong.cache",
+		"1.0.0.0\t1.0.0.255\t13335\tUS\tCLOUDFLARENET\n"+overlong+"\n")
+
+	_, err := loadFromCache(cacheFile)
+	if err == nil {
+		t.Fatal("expected an error for a line exceeding the scanner limit")
+	}
+	if !errors.Is(err, bufio.ErrTooLong) {
+		t.Errorf("error = %v, want it to wrap bufio.ErrTooLong", err)
+	}
+}
+
+func TestNewASNDatabaseWithCache_UsesExistingCache(t *testing.T) {
+	cacheFile := writeTestCache(t, "existing.cache", fixtureTSVv1)
+
+	db, err := NewASNDatabaseWithCache(cacheFile)
+	if err != nil {
+		t.Fatalf("NewASNDatabaseWithCache() error = %v", err)
+	}
+	if len(db.IPv4Entries) != 2 || len(db.IPv6Entries) != 1 {
+		t.Errorf("entries = %d/%d, want 2/1", len(db.IPv4Entries), len(db.IPv6Entries))
+	}
+
+	entry := db.LookupASN(net.ParseIP("8.8.8.8"))
+	if entry == nil || entry.GetASN() != 15169 {
+		t.Errorf("LookupASN(8.8.8.8) = %v, want AS15169", entry)
+	}
+}
+
+func TestNewASNDatabaseWithCache_CorruptCache(t *testing.T) {
+	cacheFile := filepath.Join(t.TempDir(), "corrupt.cache")
+	if err := os.WriteFile(cacheFile, []byte("not gzipped"), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	// The file exists, so no download is attempted and the parse error surfaces.
+	if _, err := NewASNDatabaseWithCache(cacheFile); err == nil {
+		t.Error("expected an error for an existing but unparsable cache file")
 	}
 }

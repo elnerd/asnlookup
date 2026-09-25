@@ -5,14 +5,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
-	"net/http"
+	"net/netip"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 const ASN_DATABASE_URL = "https://iptoasn.com/data/ip2asn-combined.tsv.gz"
@@ -84,11 +85,29 @@ type ASNEntryInterface interface {
 type ASNDatabase struct {
 	IPv4Entries []ASNEntry // Sorted slice for binary search (IPv4)
 	IPv6Entries []ASNEntry // Sorted slice for binary search (IPv6)
+
+	asnIndex  map[int]asnEntryRefs // ASN -> positions in the entry slices
+	indexOnce sync.Once
 }
 
-type ASNDatabaseInterface interface {
+// ASNLookuper is the read-only surface of a loaded database. It is satisfied
+// by both *ASNDatabase and *ASNLookup.
+type ASNLookuper interface {
 	LookupASN(ip net.IP) ASNEntryInterface
+	GetPrefixesByASN(asn int) []netip.Prefix
 }
+
+// ASNDatabaseInterface is the full surface of a refreshable database:
+// lookups plus the update and scheduling operations implemented by
+// *ASNLookup.
+type ASNDatabaseInterface interface {
+	ASNLookuper
+	UpdateDatabase() (changed bool, err error)
+	ScheduleUpdateDatabase(interval time.Duration) error
+	CancelScheduledUpdate()
+}
+
+var _ ASNLookuper = (*ASNDatabase)(nil)
 
 func (db *ASNDatabase) LookupASN(ip net.IP) ASNEntryInterface {
 	// Determine if IPv4 or IPv6
@@ -127,33 +146,18 @@ func NewASNDatabase() (*ASNDatabase, error) {
 	return NewASNDatabaseWithCache(DEFAULT_CACHE_FILE)
 }
 
+// NewASNDatabaseWithCache returns a database parsed from cacheFile, downloading
+// it first when the file does not exist yet. An existing cache file is used as
+// is, however stale it may be. No background goroutine is started; use
+// NewASNLookup for a long-running process that should stay fresh.
 func NewASNDatabaseWithCache(cacheFile string) (*ASNDatabase, error) {
 	// Check if we have a cache file
 	if _, err := os.Stat(cacheFile); err == nil {
 		return loadFromCache(cacheFile)
 	}
 
-	// Download new database file
-	resp, err := http.Get(ASN_DATABASE_URL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to download ASN database: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to download ASN database: status %d", resp.StatusCode)
-	}
-
-	// Save to cache file
-	out, err := os.Create(cacheFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cache file: %w", err)
-	}
-	defer out.Close()
-
-	// Copy downloaded content to cache
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return nil, fmt.Errorf("failed to save cache file: %w", err)
+	if _, err := DownloadASNDatabase(cacheFile); err != nil {
+		return nil, err
 	}
 
 	// Load from the newly created cache
@@ -238,6 +242,8 @@ func loadFromCache(filename string) (*ASNDatabase, error) {
 	sort.Slice(db.IPv6Entries, func(i, j int) bool {
 		return bytes.Compare(db.IPv6Entries[i].Start, db.IPv6Entries[j].Start) < 0
 	})
+
+	db.indexOnce.Do(db.buildASNIndex)
 
 	return db, nil
 }

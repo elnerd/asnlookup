@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("::\tfff:ffff:ffff:ffff:ffff:fkff:ffff:ffff\t0\t\t1")
